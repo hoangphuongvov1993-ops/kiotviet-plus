@@ -14,6 +14,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const BASE = (process.env.KIOTVIET_BASE_URL || "https://public.kiotapi.com").replace(/\/$/, "");
 const TOKEN_URL = process.env.KIOTVIET_TOKEN_URL || "https://id.kiotviet.vn/connect/token";
@@ -103,18 +106,32 @@ async function branches() {
   if (!branchCache) branchCache = (await kv("GET", "/branches", { query: { pageSize: 100 } })).data || [];
   return branchCache;
 }
+const branchName = (b) => b?.branchName || b?.name || String(b?.id);
+
+// Chi nhánh đang làm việc – lưu ra file để giữ qua các lần Javis khởi động lại kết nối
+const STATE_FILE = path.join(os.homedir(), ".kiotviet-plus.json");
+function readState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return {}; } }
+function writeState(s) { try { fs.writeFileSync(STATE_FILE, JSON.stringify(s), { mode: 0o600 }); } catch { /* bỏ qua */ } }
+async function currentBranchId() {
+  const all = await branches();
+  const saved = Number(readState().branchId);
+  if (saved && all.some((b) => b.id === saved)) return saved;
+  return Number(process.env.KIOTVIET_BRANCH_ID) || all[0]?.id;
+}
+
 async function resolveBranchIds(input) {
   const all = await branches();
   if (!input || input.length === 0) {
-    const def = Number(process.env.KIOTVIET_BRANCH_ID) || all[0]?.id;
+    const def = await currentBranchId();
     if (!def) throw new Error("Không tìm thấy chi nhánh nào.");
     return [def];
   }
   if (input.length === 1 && String(input[0]).toLowerCase() === "all") return all.map((b) => b.id);
   return input.map((x) => {
     if (/^\d+$/.test(String(x))) return Number(x);
-    const b = all.find((b) => b.branchName?.toLowerCase().includes(String(x).toLowerCase()));
-    if (!b) throw new Error(`Không tìm thấy chi nhánh "${x}". Có: ${all.map((b) => `${b.id}:${b.branchName}`).join(", ")}`);
+    const q = String(x).toLowerCase();
+    const b = all.find((b) => branchName(b).toLowerCase() === q) || all.find((b) => branchName(b).toLowerCase().includes(q));
+    if (!b) throw new Error(`Không tìm thấy chi nhánh "${x}". Có: ${all.map((b) => `${b.id}:${branchName(b)}`).join(", ")}`);
     return b.id;
   });
 }
@@ -133,11 +150,99 @@ const branchArg = z.array(z.union([z.string(), z.number()])).optional()
   .describe('Chi nhánh: danh sách id hoặc tên chi nhánh; ["all"] = tất cả chi nhánh; bỏ trống = chi nhánh mặc định');
 
 // ───────────────────────── server ─────────────────────────
-const server = new McpServer({ name: "kiotviet-plus", version: "1.0.0" });
+const server = new McpServer({ name: "kiotviet-plus", version: "1.2.0" });
 
-// ===== Chi nhánh =====
-server.tool("kvp_branches", "Liệt kê chi nhánh (id, tên) để chọn khi nhập tồn kho.", {},
-  wrap(async () => (await branches()).map((b) => ({ id: b.id, name: b.branchName, address: b.address }))));
+// ===== CHI NHÁNH =====
+server.tool("kvp_branches", "Liệt kê tất cả chi nhánh (id, tên, địa chỉ, SĐT, trạng thái) và cho biết chi nhánh đang làm việc.", {},
+  wrap(async () => {
+    branchCache = null;
+    const cur = await currentBranchId();
+    return (await branches()).map((b) => ({
+      id: b.id, name: branchName(b), code: b.branchCode || b.code, address: b.address,
+      phone: b.contactNumber || b.phoneNumber, isActive: b.isActive, current: b.id === cur,
+    }));
+  }));
+
+server.tool("kvp_branch_switch",
+  "CHUYỂN chi nhánh đang làm việc. Sau đó các thao tác thêm hàng, dịch vụ, khách, lọc hàng hoá... sẽ mặc định dùng chi nhánh này nếu không chỉ định.",
+  { branch: z.union([z.string(), z.number()]).describe("Id hoặc tên chi nhánh") },
+  wrap(async ({ branch }) => {
+    const [id] = await resolveBranchIds([branch]);
+    writeState({ ...readState(), branchId: id });
+    const b = (await branches()).find((x) => x.id === id);
+    return { switchedTo: { id, name: branchName(b) } };
+  }));
+
+server.tool("kvp_branch_rename",
+  "ĐỔI TÊN (và tuỳ chọn địa chỉ, SĐT) chi nhánh. Nếu gian hàng không cho phép sửa qua API, sẽ báo cách sửa tay.",
+  {
+    branch: z.union([z.string(), z.number()]).describe("Id hoặc tên hiện tại của chi nhánh"),
+    newName: z.string().describe("Tên mới"),
+    address: z.string().optional(),
+    contactNumber: z.string().optional(),
+  },
+  wrap(async ({ branch, newName, address, contactNumber }) => {
+    const [id] = await resolveBranchIds([branch]);
+    const old = (await branches()).find((x) => x.id === id);
+    const body = { id, branchName: newName, name: newName, address: address ?? old?.address,
+      ...(contactNumber && { contactNumber }) };
+    try {
+      await kv("PUT", `/branches/${id}`, { body });
+    } catch (e) {
+      throw new Error(`KiotViet không cho đổi tên chi nhánh qua API (${e.message}). Hãy sửa tay: KiotViet → Thiết lập (bánh răng) → Quản lý chi nhánh → bấm vào chi nhánh "${branchName(old)}" → sửa tên → Lưu.`);
+    }
+    branchCache = null;
+    const now = (await branches()).find((x) => x.id === id);
+    if (branchName(now) !== newName) {
+      return { warning: "KiotViet trả về thành công nhưng tên chưa đổi. Hãy sửa tay trong Thiết lập → Quản lý chi nhánh.", oldName: branchName(old), currentName: branchName(now) };
+    }
+    return { renamed: { id, from: branchName(old), to: branchName(now) } };
+  }));
+
+server.tool("kvp_product_list",
+  "LỌC hàng hoá theo CHI NHÁNH riêng biệt (kèm tồn kho, giá vốn tại chi nhánh đó), theo nhóm hàng, loại (hàng hoá/dịch vụ/combo), tên, chỉ hàng còn tồn hoặc sắp hết.",
+  {
+    branches: branchArg,
+    name: z.string().optional().describe("Lọc theo tên hoặc mã"),
+    category: z.union([z.number(), z.string()]).optional().describe("Nhóm hàng: id hoặc tên"),
+    type: z.enum(["hang_hoa", "dich_vu", "combo"]).optional(),
+    stock: z.enum(["all", "in_stock", "out_of_stock", "low"]).optional().default("all")
+      .describe("in_stock = còn hàng; out_of_stock = hết hàng; low = dưới định mức tồn thấp nhất"),
+    includeInactive: z.boolean().optional().describe("Gồm cả hàng ngừng kinh doanh"),
+    limit: z.number().optional().default(100),
+  },
+  wrap(async (a) => {
+    const ids = await resolveBranchIds(a.branches);
+    const all = await branches();
+    const categoryId = await resolveCategoryId(a.category);
+    const typeCode = { hang_hoa: 2, dich_vu: 3, combo: 1 }[a.type];
+    const rows = await listAll("/products", {
+      name: a.name, categoryId, includeInventory: true, isActive: a.includeInactive ? undefined : true,
+    });
+    const out = [];
+    for (const p of rows) {
+      if (typeCode && p.type !== typeCode) continue;
+      const invs = (p.inventories || []).filter((i) => ids.includes(i.branchId));
+      if (p.type !== 3 && invs.length === 0) continue; // hàng không có bản ghi kho ở chi nhánh này
+      const perBranch = invs.map((i) => ({
+        branch: branchName(all.find((b) => b.id === i.branchId)), onHand: i.onHand, cost: i.cost,
+        reserved: i.reserved, minQuantity: i.minQuantity,
+      }));
+      const onHand = invs.reduce((s, i) => s + (i.onHand || 0), 0);
+      if (a.stock === "in_stock" && !(onHand > 0)) continue;
+      if (a.stock === "out_of_stock" && onHand > 0) continue;
+      if (a.stock === "low" && !invs.some((i) => i.minQuantity != null && (i.onHand || 0) <= i.minQuantity)) continue;
+      out.push({ id: p.id, code: p.code, name: p.fullName || p.name, category: p.categoryName,
+        type: { 1: "combo", 2: "hàng hoá", 3: "dịch vụ" }[p.type] || p.type, basePrice: p.basePrice, unit: p.unit,
+        totalOnHand: onHand, branches: perBranch });
+    }
+    return {
+      branches: ids.map((id) => branchName(all.find((b) => b.id === id))),
+      total: out.length,
+      items: out.slice(0, a.limit),
+      note: out.length > a.limit ? `Chỉ hiện ${a.limit}/${out.length}. Thu hẹp bộ lọc hoặc tăng limit.` : undefined,
+    };
+  }));
 
 // ===== HÀNG HOÁ =====
 const inventoryArg = z.object({
@@ -258,6 +363,135 @@ server.tool("kvp_category_delete",
     requireConfirm(confirm, "nhóm hàng");
     await kv("DELETE", `/categories/${id}`);
     return { deleted: true, id };
+  }));
+
+// ===== DỊCH VỤ (hàng hoá loại 3) =====
+const SERVICE_TYPE = 3;
+const TYPE_NAME = { 1: "combo", 2: "hàng hoá", 3: "dịch vụ" };
+
+let categoryCache = { at: 0, rows: [] };
+async function categories() {
+  if (Date.now() - categoryCache.at > 5 * 60 * 1000) {
+    categoryCache = { at: Date.now(), rows: await listAll("/categories", { hierarchicalData: false }) };
+  }
+  return categoryCache.rows;
+}
+async function resolveCategoryId(input) {
+  if (input === undefined || input === null || input === "") return undefined;
+  if (/^\d+$/.test(String(input))) return Number(input);
+  const all = await categories();
+  const q = String(input).toLowerCase().trim();
+  const hit = all.find((c) => c.categoryName?.toLowerCase() === q)
+    || all.find((c) => c.categoryName?.toLowerCase().includes(q));
+  if (!hit) throw new Error(`Không tìm thấy nhóm hàng "${input}". Có: ${all.map((c) => `${c.categoryId}:${c.categoryName}`).join(", ")}`);
+  return hit.categoryId;
+}
+async function getService(id) {
+  const p = await kv("GET", `/products/${id}`);
+  if (p.type !== SERVICE_TYPE) {
+    throw new Error(`Id ${id} ("${p.name}") là ${TYPE_NAME[p.type] || "loại " + p.type}, không phải dịch vụ – không thao tác để tránh nhầm.`);
+  }
+  return p;
+}
+const brief = (p) => ({
+  id: p.id, code: p.code, name: p.fullName || p.name, categoryId: p.categoryId, categoryName: p.categoryName,
+  basePrice: p.basePrice, unit: p.unit, isActive: p.isActive, allowsSale: p.allowsSale,
+  type: TYPE_NAME[p.type] || p.type,
+});
+const categoryArg = z.union([z.number(), z.string()]).describe("Nhóm hàng: id hoặc tên nhóm");
+
+server.tool("kvp_service_list", "Danh sách DỊCH VỤ, lọc theo tên hoặc nhóm hàng.",
+  { name: z.string().optional().describe("Lọc theo tên/mã"), category: categoryArg.optional(), includeInactive: z.boolean().optional() },
+  wrap(async ({ name, category, includeInactive }) => {
+    const categoryId = await resolveCategoryId(category);
+    const rows = await listAll("/products", { name, categoryId, includeInventory: false, isActive: includeInactive ? undefined : true });
+    const services = rows.filter((p) => p.type === SERVICE_TYPE).map(brief);
+    return { total: services.length, services };
+  }));
+
+server.tool("kvp_service_create", "Thêm DỊCH VỤ mới (không quản lý tồn kho).",
+  {
+    name: z.string().describe("Tên dịch vụ (bắt buộc)"),
+    category: categoryArg.describe("Nhóm hàng (bắt buộc): id hoặc tên"),
+    basePrice: z.number().describe("Giá bán"),
+    cost: z.number().optional().describe("Giá vốn"),
+    code: z.string().optional().describe("Mã – bỏ trống để tự sinh"),
+    fullName: z.string().optional().describe("Tên trên hoá đơn điện tử"),
+    unit: z.string().optional().describe("Đơn vị, vd: lần, giờ, gói"),
+    description: z.string().optional(),
+    images: z.array(z.string().url()).optional(),
+    allowsSale: z.boolean().optional().default(true),
+    isRewardPoint: z.boolean().optional().default(false),
+    branches: branchArg,
+  },
+  wrap(async (a) => {
+    const categoryId = await resolveCategoryId(a.category);
+    const ids = await resolveBranchIds(a.branches);
+    const created = await kv("POST", "/products", {
+      body: {
+        type: SERVICE_TYPE, name: a.name, categoryId, basePrice: a.basePrice, code: a.code, fullName: a.fullName,
+        unit: a.unit, description: a.description, images: a.images, allowsSale: a.allowsSale,
+        isRewardPoint: a.isRewardPoint, isActive: true,
+        inventories: ids.map((branchId) => ({ branchId, onHand: 0, cost: a.cost ?? 0 })),
+      },
+    });
+    const id = created?.id ?? created?.data?.id;
+    if (id) {
+      const check = await kv("GET", `/products/${id}`);
+      if (check.type !== SERVICE_TYPE) {
+        return { warning: `KiotViet đã tạo nhưng lưu thành ${TYPE_NAME[check.type] || check.type}, không phải dịch vụ. Hãy kiểm tra lại trên KiotViet.`, product: brief(check) };
+      }
+      return { created: brief(check) };
+    }
+    return created;
+  }));
+
+server.tool("kvp_service_update", "Sửa DỊCH VỤ: tên, giá, giá vốn, đơn vị, mô tả, bật/ngừng kinh doanh.",
+  {
+    id: z.number().describe("Id dịch vụ"),
+    name: z.string().optional(), basePrice: z.number().optional(), cost: z.number().optional(),
+    fullName: z.string().optional(), unit: z.string().optional(), description: z.string().optional(),
+    images: z.array(z.string().url()).optional(), allowsSale: z.boolean().optional(),
+    isActive: z.boolean().optional().describe("false = ngừng kinh doanh"),
+    branches: branchArg,
+  },
+  wrap(async ({ id, cost, branches: br, ...fields }) => {
+    await getService(id);
+    const body = { id, ...Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined)) };
+    if (cost !== undefined) {
+      const ids = await resolveBranchIds(br);
+      body.inventories = ids.map((branchId) => ({ branchId, cost }));
+    }
+    await kv("PUT", `/products/${id}`, { body });
+    return { updated: brief(await kv("GET", `/products/${id}`)) };
+  }));
+
+server.tool("kvp_service_move", "DI CHUYỂN một hoặc nhiều dịch vụ sang nhóm hàng khác.",
+  {
+    ids: z.array(z.number()).describe("Danh sách id dịch vụ"),
+    toCategory: categoryArg.describe("Nhóm hàng đích: id hoặc tên"),
+  },
+  wrap(async ({ ids, toCategory }) => {
+    const categoryId = await resolveCategoryId(toCategory);
+    const moved = [], failed = [];
+    for (const id of ids) {
+      try {
+        const s = await getService(id);
+        await kv("PUT", `/products/${id}`, { body: { id, categoryId } });
+        moved.push({ id, name: s.name, from: s.categoryName, toCategoryId: categoryId });
+      } catch (e) { failed.push({ id, error: String(e.message || e) }); }
+    }
+    return { moved, failed };
+  }));
+
+server.tool("kvp_service_delete",
+  "XOÁ dịch vụ. Bắt buộc confirm=true sau khi chủ cửa hàng đồng ý. Dịch vụ đã có giao dịch có thể bị KiotViet từ chối xoá – khi đó dùng kvp_service_update isActive=false để ngừng kinh doanh.",
+  { id: z.number(), confirm: z.boolean().optional() },
+  wrap(async ({ id, confirm }) => {
+    const s = await getService(id);
+    requireConfirm(confirm, `dịch vụ "${s.name}"`);
+    await kv("DELETE", `/products/${id}`);
+    return { deleted: true, id, name: s.name };
   }));
 
 // ===== KHÁCH HÀNG =====
