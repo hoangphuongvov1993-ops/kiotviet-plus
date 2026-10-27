@@ -17,6 +17,7 @@ import { z } from "zod";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { registerWebTools } from "./web.mjs";
 
 const BASE = (process.env.KIOTVIET_BASE_URL || "https://public.kiotapi.com").replace(/\/$/, "");
 const TOKEN_URL = process.env.KIOTVIET_TOKEN_URL || "https://id.kiotviet.vn/connect/token";
@@ -150,7 +151,7 @@ const branchArg = z.array(z.union([z.string(), z.number()])).optional()
   .describe('Chi nhánh: danh sách id hoặc tên chi nhánh; ["all"] = tất cả chi nhánh; bỏ trống = chi nhánh mặc định');
 
 // ───────────────────────── server ─────────────────────────
-const server = new McpServer({ name: "kiotviet-plus", version: "1.2.0" });
+const server = new McpServer({ name: "kiotviet-plus", version: "1.3.0" });
 
 // ===== CHI NHÁNH =====
 server.tool("kvp_branches", "Liệt kê tất cả chi nhánh (id, tên, địa chỉ, SĐT, trạng thái) và cho biết chi nhánh đang làm việc.", {},
@@ -618,5 +619,8 @@ server.tool(
     };
   }),
 );
+
+// ===== PHẦN WEB: ngừng/cho kinh doanh theo chi nhánh, đổi nhóm, thiết lập điểm, xoá =====
+registerWebTools(server, z, { wrap, requireConfirm, resolveCategoryId });
 
 await server.connect(new StdioServerTransport());

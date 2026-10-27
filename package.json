@@ -1,11 +1,13 @@
 {
   "name": "kiotviet-plus",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "type": "module",
   "main": "index.mjs",
   "bin": { "kiotviet-plus": "index.mjs" },
+  "files": ["index.mjs", "web.mjs"],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.0",
+    "playwright-core": "^1.49.0",
     "zod": "^3.25.0"
   }
 }
