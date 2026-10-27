@@ -8,7 +8,8 @@
  * Cấu hình (biến môi trường, đều tuỳ chọn):
  *   KIOTVIET_RETAILER          tên gian hàng, vd: pinpinfoods  (dùng chung với phần API)
  *   KIOTVIET_WEB_CDP           địa chỉ trình duyệt của Javis, mặc định http://127.0.0.1:9333
- *   KIOTVIET_WEB_COOKIES_FILE  file cookie KiotViet (JSON xuất từ tiện ích Cookie-Editor)
+ *   KIOTVIET_WEB_COOKIES       NỘI DUNG cookie KiotViet (dán nguyên JSON xuất từ tiện ích Cookie-Editor)
+ *   KIOTVIET_WEB_COOKIES_FILE  hoặc đường dẫn file chứa JSON đó
  *                              – dùng khi trình duyệt của Javis chưa đăng nhập KiotViet
  *   KIOTVIET_CHROME_PATH       đường dẫn Chromium nếu không kết nối được trình duyệt Javis
  */
@@ -46,8 +47,11 @@ function findChromium() {
 }
 
 function readCookieFile() {
-  if (!COOKIES_FILE) return [];
-  const raw = JSON.parse(fs.readFileSync(COOKIES_FILE, "utf8"));
+  let text = process.env.KIOTVIET_WEB_COOKIES || "";
+  if (!text && COOKIES_FILE) text = fs.readFileSync(COOKIES_FILE, "utf8");
+  if (!text.trim()) return [];
+  let raw;
+  try { raw = JSON.parse(text); } catch { throw new Error("KIOTVIET_WEB_COOKIES không phải JSON hợp lệ (hãy dán nguyên nội dung Export → JSON của Cookie-Editor)."); }
   const list = Array.isArray(raw) ? raw : raw.cookies || [];
   const same = { no_restriction: "None", none: "None", lax: "Lax", strict: "Strict" };
   return list
@@ -88,8 +92,11 @@ async function isReady(p) {
     return await p.evaluate(() => {
       const ng = window.angular;
       if (!ng) return false;
+      if (/#\/login/i.test(location.href)) return false;
       const inj = ng.element(document.body).injector();
-      return !!(inj && inj.has("ProductResource") && inj.get("kvSession").branchs);
+      if (!inj || !inj.has("ProductResource")) return false;
+      const s = inj.get("kvSession");
+      return !!(s && s.user && s.retailer && Array.isArray(s.branchs) && s.branchs.length > 0);
     });
   } catch { return false; }
 }
@@ -103,13 +110,21 @@ async function kvPage() {
   if (!page.url().includes("/man")) await page.goto(MAN_URL(), { waitUntil: "domcontentloaded", timeout: 45000 });
   for (let i = 0; i < 30; i++) {
     if (await isReady(page)) return page;
-    if (/#\/login|\/login/i.test(page.url())) break;
+    if (i > 5 && /#\/login|\/login/i.test(page.url())) break;
     await page.waitForTimeout(1000);
   }
+  // Có thể cookie vừa được nạp: tải lại trang một lần rồi thử tiếp
+  if (!/#\/login/i.test(page.url())) {
+    await page.goto(MAN_URL(), { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+    for (let i = 0; i < 15; i++) {
+      if (await isReady(page)) return page;
+      await page.waitForTimeout(1000);
+    }
+  }
   throw new Error(
-    "Trình duyệt của Javis chưa đăng nhập KiotViet. Cách xử lý: trên máy tính, đăng nhập KiotViet bằng Chrome, " +
-    "xuất cookie của trang kiotviet.vn (tiện ích Cookie-Editor → Export JSON), rồi nạp vào Javis → Cookies, " +
-    "hoặc lưu file trên VPS và đặt biến KIOTVIET_WEB_COOKIES_FILE.",
+    "CHƯA ĐĂNG NHẬP KiotViet trong trình duyệt của Javis (không thấy chi nhánh nào). Cách xử lý: trên máy tính, mở KiotViet " +
+    "đang đăng nhập bằng Chrome → tiện ích Cookie-Editor → Export → JSON, rồi dán nội dung đó vào biến KIOTVIET_WEB_COOKIES " +
+    "trong cấu hình kết nối kiotviet-plus của Javis. Cookie hết hạn khi đăng xuất KiotViet – khi đó xuất lại.",
   );
 }
 
