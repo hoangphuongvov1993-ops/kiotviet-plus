@@ -8,7 +8,9 @@
  * Cấu hình (biến môi trường, đều tuỳ chọn):
  *   KIOTVIET_RETAILER          tên gian hàng, vd: pinpinfoods  (dùng chung với phần API)
  *   KIOTVIET_WEB_CDP           địa chỉ trình duyệt của Javis, mặc định http://127.0.0.1:9333
- *   KIOTVIET_WEB_COOKIES       NỘI DUNG cookie KiotViet (dán nguyên JSON xuất từ tiện ích Cookie-Editor)
+ *   KIOTVIET_WEB_USER          tên đăng nhập KiotViet (chủ cửa hàng tự nhập trong cấu hình Javis)
+ *   KIOTVIET_WEB_PASSWORD      mật khẩu KiotViet (chủ cửa hàng tự nhập; code chỉ điền vào trang đăng nhập)
+ *   KIOTVIET_WEB_COOKIES       (tuỳ chọn) NỘI DUNG cookie KiotViet (dán nguyên JSON xuất từ tiện ích Cookie-Editor)
  *   KIOTVIET_WEB_COOKIES_FILE  hoặc đường dẫn file chứa JSON đó
  *                              – dùng khi trình duyệt của Javis chưa đăng nhập KiotViet
  *   KIOTVIET_CHROME_PATH       đường dẫn Chromium nếu không kết nối được trình duyệt Javis
@@ -101,36 +103,131 @@ async function isReady(p) {
   } catch { return false; }
 }
 
-/** Trả về tab KiotViet đã đăng nhập và sẵn sàng. */
-async function kvPage() {
+/** Mở (hoặc dùng lại) tab KiotViet; chờ trang tải xong. Trả về { page, ready }. */
+async function openKv({ reload = false } = {}) {
   if (!RETAILER) throw new Error("Thiếu KIOTVIET_RETAILER (tên gian hàng).");
   await ensureBrowser();
-  if (page && !page.isClosed() && (await isReady(page))) return page;
-  page = context.pages().find((p) => p.url().includes(`${RETAILER}.kiotviet.vn/man`)) || (await context.newPage());
-  if (!page.url().includes("/man") || /login/i.test(page.url())) {
+  if (!reload && page && !page.isClosed() && (await isReady(page))) return { page, ready: true };
+  if (!page || page.isClosed()) {
+    page = context.pages().find((p) => p.url().includes(`${RETAILER}.kiotviet.vn/man`)) || (await context.newPage());
+  }
+  if (reload || !page.url().includes(`${RETAILER}.kiotviet.vn/man`)) {
     await page.goto(MAN_URL(), { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
   }
-  for (let i = 0; i < 15; i++) {
-    if (await isReady(page)) return page;
-    if (i > 5 && /login/i.test(page.url())) break;
+  for (let i = 0; i < 20; i++) {
+    if (await isReady(page)) return { page, ready: true };
+    if (i >= 4 && /login/i.test(page.url()) && (await page.locator("input[type=password]:visible").count()) > 0) break;
     await page.waitForTimeout(1000);
   }
-  // Cookie có thể vừa được nạp: luôn tải lại trang quản lý một lần (kể cả khi đang ở màn hình đăng nhập)
-  await page.goto("about:blank").catch(() => {});
-  await page.goto(MAN_URL(), { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
-  for (let i = 0; i < 25; i++) {
-    if (await isReady(page)) return page;
-    await page.waitForTimeout(1000);
-  }
-  const kvCookies = (await context.cookies(`https://${RETAILER}.kiotviet.vn`).catch(() => []))
-    .map((c) => c.name).filter((n) => /kv-session|retailer/i.test(n));
-  const loaded = readCookieFile().length;
+  return { page, ready: await isReady(page) };
+}
+
+/** Trả về tab KiotViet đã đăng nhập và sẵn sàng. */
+async function kvPage() {
+  let r = await openKv();
+  if (!r.ready) r = await openKv({ reload: true });
+  if (r.ready) return r.page;
   throw new Error(
-    `[chẩn đoán] trang hiện tại: ${page.url()} · cookie đã nạp từ cấu hình: ${loaded} · cookie phiên đang có: ${kvCookies.join(", ") || "không có"}. ` +
-    "CHƯA ĐĂNG NHẬP KiotViet trong trình duyệt của Javis (không thấy chi nhánh nào). Cách xử lý: trên máy tính, mở KiotViet " +
-    "đang đăng nhập bằng Chrome → tiện ích Cookie-Editor → Export → JSON, rồi dán nội dung đó vào biến KIOTVIET_WEB_COOKIES " +
-    "trong cấu hình kết nối kiotviet-plus của Javis. Cookie hết hạn khi đăng xuất KiotViet – khi đó xuất lại.",
+    `CHƯA ĐĂNG NHẬP KiotViet trong trình duyệt của Javis (trang: ${r.page.url()}). ` +
+    "Hãy gọi kvw_login trước (cần KIOTVIET_WEB_USER và KIOTVIET_WEB_PASSWORD trong cấu hình kết nối).",
   );
+}
+
+// ───────────────────────── đăng nhập từ VPS ─────────────────────────
+async function visibleText(p, selector) {
+  return p.evaluate((sel) => [...document.querySelectorAll(sel)]
+    .filter((e) => e.offsetParent !== null && e.innerText && e.innerText.trim())
+    .map((e) => e.innerText.trim().replace(/\s+/g, " ").slice(0, 200)), selector).catch(() => []);
+}
+
+async function pageMessages(p) {
+  const list = await visibleText(p, ".error, .text-danger, .validation-summary-errors, .field-validation-error, .toast, .k-notification, [class*=error], [class*=alert], [role=alert]");
+  return [...new Set(list)].filter((t) => t.length > 3).slice(0, 5);
+}
+
+async function hasCaptcha(p) {
+  return p.evaluate(() => !!document.querySelector("iframe[src*=captcha], iframe[src*=recaptcha], .g-recaptcha, img[src*=aptcha], input[name*=aptcha]")).catch(() => false);
+}
+
+/** Tìm ô nhập mã OTP đang hiện trên trang. */
+async function otpInput(p) {
+  const cands = p.locator("input:visible").filter({ hasNot: p.locator("[type=password]") });
+  const n = await cands.count();
+  for (let i = 0; i < n; i++) {
+    const el = cands.nth(i);
+    const info = await el.evaluate((e) => ({
+      type: e.type, name: (e.name || "") + " " + (e.id || "") + " " + (e.placeholder || "") + " " + (e.getAttribute("autocomplete") || ""),
+      max: e.maxLength, val: e.value,
+    })).catch(() => null);
+    if (!info || ["checkbox", "radio", "hidden", "submit", "button"].includes(info.type)) continue;
+    if (/otp|code|mã|ma xac|verify|xác/i.test(info.name) || info.type === "tel" || info.type === "number" || (info.max > 0 && info.max <= 8)) return el;
+  }
+  return null;
+}
+
+async function clickByText(p, re) {
+  const btns = p.locator("button:visible, a:visible, input[type=submit]:visible, [role=button]:visible");
+  const n = await btns.count();
+  for (let i = 0; i < n; i++) {
+    const t = ((await btns.nth(i).innerText().catch(() => "")) || (await btns.nth(i).getAttribute("value").catch(() => "")) || "").trim();
+    if (re.test(t)) { await btns.nth(i).click(); return t; }
+  }
+  return null;
+}
+
+async function waitAfterSubmit(p, ms = 20000) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    await p.waitForTimeout(1000);
+    if (await isReady(p)) return "ready";
+    if (await otpInput(p)) return "otp";
+    if (await hasCaptcha(p)) return "captcha";
+  }
+  return "unknown";
+}
+
+async function loginFlow(otp) {
+  const { page: p, ready } = await openKv();
+  if (ready) return { loggedIn: true, note: "Đã đăng nhập sẵn." };
+
+  // Bước 2: nhập mã OTP
+  if (otp) {
+    const box = await otpInput(p);
+    if (!box) return { loggedIn: false, error: "Không thấy ô nhập mã OTP. Gọi kvw_login (không có otp) để bắt đầu lại.", page: p.url(), messages: await pageMessages(p) };
+    await box.fill(String(otp).trim());
+    const clicked = await clickByText(p, /xác nhận|xác thực|tiếp tục|đăng nhập|gửi|confirm|verify|ok/i);
+    if (!clicked) await box.press("Enter");
+    const st = await waitAfterSubmit(p);
+    if (st === "ready") return { loggedIn: true, note: "Đăng nhập thành công. Trình duyệt của Javis sẽ giữ phiên này." };
+    return { loggedIn: false, state: st, page: p.url(), messages: await pageMessages(p) };
+  }
+
+  // Bước 1: tên đăng nhập + mật khẩu
+  const user = process.env.KIOTVIET_WEB_USER;
+  const pass = process.env.KIOTVIET_WEB_PASSWORD;
+  if (!user || !pass) {
+    return { loggedIn: false, error: "Thiếu KIOTVIET_WEB_USER hoặc KIOTVIET_WEB_PASSWORD. Chủ cửa hàng tự nhập 2 biến này trong cấu hình kết nối kiotviet-plus của Javis." };
+  }
+  if (!/login/i.test(p.url())) await p.goto(`https://${RETAILER}.kiotviet.vn/man/#/login`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  const pw = p.locator("input[type=password]:visible").first();
+  await pw.waitFor({ timeout: 20000 });
+  if (await hasCaptcha(p)) return { loggedIn: false, state: "captcha", error: "Trang đăng nhập đang yêu cầu captcha – không tự vượt qua được. Đợi ít phút rồi thử lại, hoặc đăng nhập tay." };
+  const userBox = p.locator("input:visible:not([type=password]):not([type=checkbox]):not([type=hidden])").first();
+  await userBox.fill(user);
+  await pw.fill(pass);
+  const clicked = await clickByText(p, /^quản lý$/i) || await clickByText(p, /quản lý|đăng nhập|login/i);
+  if (!clicked) await pw.press("Enter");
+  const st = await waitAfterSubmit(p);
+  if (st === "ready") return { loggedIn: true, note: "Đăng nhập thành công." };
+  if (st === "otp") {
+    return {
+      loggedIn: false, needOtp: true,
+      next: "KiotViet yêu cầu mã xác thực (OTP). Hỏi chủ cửa hàng mã vừa nhận (SMS/ứng dụng/email), rồi gọi kvw_login với otp=<mã>. Mã thường hết hạn sau vài phút.",
+      screen: (await visibleText(p, "h1,h2,h3,label,p")).slice(0, 6),
+    };
+  }
+  if (st === "captcha") return { loggedIn: false, state: "captcha", error: "KiotViet hiện captcha – không tự vượt qua được." };
+  return { loggedIn: false, state: st, page: p.url(), messages: await pageMessages(p), screen: (await visibleText(p, "h1,h2,h3,label")).slice(0, 6) };
 }
 
 /** Chạy một đoạn code trong trang KiotViet với các dịch vụ của trang. */
@@ -253,6 +350,11 @@ export function registerWebTools(server, z, { wrap, requireConfirm, resolveCateg
   const codesArg = z.array(z.string()).min(1).describe("Danh sách MÃ HÀNG, vd [\"SP000011\",\"SP000012\"]");
   const branchesArg = z.array(z.union([z.string(), z.number()])).optional()
     .describe('Chi nhánh áp dụng: tên hoặc id, vd ["CN 99"]; bỏ trống hoặc ["all"] = TOÀN HỆ THỐNG');
+
+  server.tool("kvw_login",
+    "ĐĂNG NHẬP KiotViet trong trình duyệt của Javis (chỉ cần 1 lần, phiên được giữ). Gọi không có otp để bắt đầu; nếu kết quả needOtp=true thì hỏi chủ cửa hàng mã OTP rồi gọi lại với otp. Mật khẩu lấy từ cấu hình, KHÔNG hỏi mật khẩu trong chat.",
+    { otp: z.string().optional().describe("Mã xác thực KiotViet gửi về (nếu được yêu cầu)") },
+    wrap(async ({ otp }) => loginFlow(otp)));
 
   server.tool("kvw_status",
     "Kiểm tra kết nối trang quản lý KiotViet (phần WEB) và liệt kê chi nhánh. Gọi trước khi dùng các công cụ kvw_*.",
