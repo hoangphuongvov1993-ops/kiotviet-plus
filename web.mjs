@@ -107,21 +107,26 @@ async function kvPage() {
   await ensureBrowser();
   if (page && !page.isClosed() && (await isReady(page))) return page;
   page = context.pages().find((p) => p.url().includes(`${RETAILER}.kiotviet.vn/man`)) || (await context.newPage());
-  if (!page.url().includes("/man")) await page.goto(MAN_URL(), { waitUntil: "domcontentloaded", timeout: 45000 });
-  for (let i = 0; i < 30; i++) {
+  if (!page.url().includes("/man") || /login/i.test(page.url())) {
+    await page.goto(MAN_URL(), { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+  }
+  for (let i = 0; i < 15; i++) {
     if (await isReady(page)) return page;
-    if (i > 5 && /#\/login|\/login/i.test(page.url())) break;
+    if (i > 5 && /login/i.test(page.url())) break;
     await page.waitForTimeout(1000);
   }
-  // Có thể cookie vừa được nạp: tải lại trang một lần rồi thử tiếp
-  if (!/#\/login/i.test(page.url())) {
-    await page.goto(MAN_URL(), { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
-    for (let i = 0; i < 15; i++) {
-      if (await isReady(page)) return page;
-      await page.waitForTimeout(1000);
-    }
+  // Cookie có thể vừa được nạp: luôn tải lại trang quản lý một lần (kể cả khi đang ở màn hình đăng nhập)
+  await page.goto("about:blank").catch(() => {});
+  await page.goto(MAN_URL(), { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+  for (let i = 0; i < 25; i++) {
+    if (await isReady(page)) return page;
+    await page.waitForTimeout(1000);
   }
+  const kvCookies = (await context.cookies(`https://${RETAILER}.kiotviet.vn`).catch(() => []))
+    .map((c) => c.name).filter((n) => /kv-session|retailer/i.test(n));
+  const loaded = readCookieFile().length;
   throw new Error(
+    `[chẩn đoán] trang hiện tại: ${page.url()} · cookie đã nạp từ cấu hình: ${loaded} · cookie phiên đang có: ${kvCookies.join(", ") || "không có"}. ` +
     "CHƯA ĐĂNG NHẬP KiotViet trong trình duyệt của Javis (không thấy chi nhánh nào). Cách xử lý: trên máy tính, mở KiotViet " +
     "đang đăng nhập bằng Chrome → tiện ích Cookie-Editor → Export → JSON, rồi dán nội dung đó vào biến KIOTVIET_WEB_COOKIES " +
     "trong cấu hình kết nối kiotviet-plus của Javis. Cookie hết hạn khi đăng xuất KiotViet – khi đó xuất lại.",
