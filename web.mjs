@@ -145,8 +145,24 @@ async function pageMessages(p) {
   return [...new Set(list)].filter((t) => t.length > 3).slice(0, 5);
 }
 
+/** Chỉ coi là captcha khi có THỬ THÁCH HIỆN RA bắt người bấm/nhập (captcha chạy ngầm thì bỏ qua). */
 async function hasCaptcha(p) {
-  return p.evaluate(() => !!document.querySelector("iframe[src*=captcha], iframe[src*=recaptcha], .g-recaptcha, img[src*=aptcha], input[name*=aptcha]")).catch(() => false);
+  return p.evaluate(() => {
+    const shown = (e) => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e); return r.width > 60 && r.height > 40 && s.visibility !== "hidden" && s.display !== "none" && s.opacity !== "0"; };
+    const frames = [...document.querySelectorAll("iframe")].filter((f) => /captcha|recaptcha|hcaptcha|turnstile/i.test(f.src || f.title || ""));
+    const challenge = frames.some((f) => shown(f) && !/anchor.*size=invisible/i.test(f.src || ""));
+    const imgCaptcha = [...document.querySelectorAll("img[src*=aptcha], input[name*=aptcha], input[id*=aptcha]")].some(shown);
+    return challenge || imgCaptcha;
+  }).catch(() => false);
+}
+
+
+async function captchaInfo(p) {
+  return p.evaluate(() => [...document.querySelectorAll("iframe")].map((f) => {
+    const r = f.getBoundingClientRect();
+    let host = ""; try { host = new URL(f.src).host + new URL(f.src).pathname.slice(0, 40); } catch {}
+    return `${host || f.title || "iframe"} ${Math.round(r.width)}x${Math.round(r.height)}`;
+  }).slice(0, 6)).catch(() => []);
 }
 
 /** Tìm ô nhập mã OTP đang hiện trên trang. */
@@ -211,7 +227,7 @@ async function loginFlow(otp) {
   if (!/login/i.test(p.url())) await p.goto(`https://${RETAILER}.kiotviet.vn/man/#/login`, { waitUntil: "domcontentloaded" }).catch(() => {});
   const pw = p.locator("input[type=password]:visible").first();
   await pw.waitFor({ timeout: 20000 });
-  if (await hasCaptcha(p)) return { loggedIn: false, state: "captcha", error: "Trang đăng nhập đang yêu cầu captcha – không tự vượt qua được. Đợi ít phút rồi thử lại, hoặc đăng nhập tay." };
+  if (await hasCaptcha(p)) return { loggedIn: false, state: "captcha", error: "Trang đăng nhập đang hiện captcha bắt người bấm – không tự vượt qua được. Đợi ít phút rồi thử lại.", detail: await captchaInfo(p) };
   const userBox = p.locator("input:visible:not([type=password]):not([type=checkbox]):not([type=hidden])").first();
   await userBox.fill(user);
   await pw.fill(pass);
@@ -226,7 +242,7 @@ async function loginFlow(otp) {
       screen: (await visibleText(p, "h1,h2,h3,label,p")).slice(0, 6),
     };
   }
-  if (st === "captcha") return { loggedIn: false, state: "captcha", error: "KiotViet hiện captcha – không tự vượt qua được." };
+  if (st === "captcha") return { loggedIn: false, state: "captcha", error: "Sau khi bấm đăng nhập, KiotViet hiện captcha bắt người bấm – không tự vượt qua được.", detail: await captchaInfo(p), messages: await pageMessages(p) };
   return { loggedIn: false, state: st, page: p.url(), messages: await pageMessages(p), screen: (await visibleText(p, "h1,h2,h3,label")).slice(0, 6) };
 }
 
